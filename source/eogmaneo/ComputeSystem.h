@@ -1,6 +1,6 @@
 // ----------------------------------------------------------------------------
 //  EOgmaNeo
-//  Copyright(c) 2017 Ogma Intelligent Systems Corp. All rights reserved.
+//  Copyright(c) 2017-2018 Ogma Intelligent Systems Corp. All rights reserved.
 //
 //  This copy of EOgmaNeo is licensed to you under the terms described
 //  in the EOGMANEO_LICENSE.md file included in this distribution.
@@ -36,12 +36,9 @@ namespace eogmaneo {
 		
 		friend class Layer;
 		friend class Hierarchy;
-		friend class RandomEncoder;
-        friend class GaborEncoder;
-		friend class CornerEncoder;
-		friend class LocalRegressor;
 		
-		friend std::vector<float> whiten(const std::vector<float> &src, int width, int radius, float strength, ComputeSystem &cs, int chunkSize);
-        friend std::vector<float> sobel(const std::vector<float> &src, int width, float clip, ComputeSystem &cs, int chunkSize);
+		friend class KMeansEncoder;
+		friend class ImageEncoder;
+		friend class GaborEncoder;
     };
 }

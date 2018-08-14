@@ -1,6 +1,6 @@
 // ----------------------------------------------------------------------------
 //  EOgmaNeo
-//  Copyright(c) 2017 Ogma Intelligent Systems Corp. All rights reserved.
+//  Copyright(c) 2017-2018 Ogma Intelligent Systems Corp. All rights reserved.
 //
 //  This copy of EOgmaNeo is licensed to you under the terms described
 //  in the EOGMANEO_LICENSE.md file included in this distribution.
@@ -13,19 +13,18 @@
 #include <random>
 
 namespace eogmaneo {
-	class RandomEncoder;
+	class KMeansEncoder;
 	
     /*!
-    \brief Random encoder work item. Internal use only.
+    \brief Image encoder work item. Internal use only.
     */
-	class RandomEncoderWorkItem : public WorkItem {
+	class KMeansEncoderActivateWorkItem : public WorkItem {
 	public:
-		RandomEncoder* _pEncoder;
+		KMeansEncoder* _pEncoder;
 
 		int _cx, _cy;
-		bool _useDistanceMetric;
 
-		RandomEncoderWorkItem()
+		KMeansEncoderActivateWorkItem()
 			: _pEncoder(nullptr)
 		{}
 
@@ -33,15 +32,15 @@ namespace eogmaneo {
 	};
 	
     /*!
-    \brief Random decoder work item. Internal use only.
+    \brief Image decoder work item. Internal use only.
     */
-	class RandomDecoderWorkItem : public WorkItem {
+	class KMeansEncoderReconstructWorkItem : public WorkItem {
 	public:
-		RandomEncoder* _pEncoder;
+		KMeansEncoder* _pEncoder;
 
 		int _cx, _cy;
 
-		RandomDecoderWorkItem()
+		KMeansEncoderReconstructWorkItem()
 			: _pEncoder(nullptr)
 		{}
 
@@ -49,17 +48,17 @@ namespace eogmaneo {
 	};
 
     /*!
-    \brief Random learn work item. Internal use only.
+    \brief Image learn work item. Internal use only.
     */
-    class RandomLearnWorkItem : public WorkItem {
+    class KMeansEncoderLearnWorkItem : public WorkItem {
     public:
-        RandomEncoder* _pEncoder;
+        KMeansEncoder* _pEncoder;
 
         int _cx, _cy;
-        float _alpha;
-        float _gamma;
 
-        RandomLearnWorkItem()
+        float _alpha;
+
+        KMeansEncoderLearnWorkItem()
             : _pEncoder(nullptr)
         {}
 
@@ -67,30 +66,27 @@ namespace eogmaneo {
     };
 	
     /*!
-    \brief Encoders values to a chunked SDR through random transformation.
+    \brief Encoders values to a columnar SDR through random transformation.
     */
-    class RandomEncoder {
+    class KMeansEncoder {
     private:
         int _inputWidth, _inputHeight;
         int _hiddenWidth, _hiddenHeight;
-        int _chunkSize;
+        int _columnSize;
         int _radius;
 
         std::vector<int> _hiddenStates;
 
-        std::vector<float> _hiddenActivations;
-        std::vector<float> _hiddenBiases;
-
         std::vector<float> _weights;
-		
-		void activate(int cx, int cy, bool useDistanceMetric);
+
+		void activate(int cx, int cy);
 		void reconstruct(int cx, int cy);
-        void learn(int cx, int cy, float alpha, float gamma);
+        void learn(int cx, int cy, float alpha);
 
 		std::vector<int> _reconHiddenStates;
-		std::vector<float> _input;
-		std::vector<float> _recon;
-		std::vector<float> _count;
+		std::vector<float> _inputs;
+		std::vector<float> _recons;
+		std::vector<float> _counts;
 		
     public:
         /*!
@@ -99,50 +95,36 @@ namespace eogmaneo {
         \param inputHeight input image height.
         \param hiddenWidth hidden SDR width.
         \param hiddenHeight hidden SDR height.
-        \param chunkSize chunk diameter of hidden SDR.
+        \param columnSize column size of hidden SDR.
         \param radius radius onto the input.
-        \param initMinWeight initial smallest weight (random, uniform).
-        \param initMaxWeight initial largest weight (random, uniform).
         \param seed random number generator seed used when generating this encoder.
-        \param normalize whether to normalize (L2) the weights.
         */
-        void create(int inputWidth, int inputHeight, int hiddenWidth, int hiddenHeight, int chunkSize, int radius,
-            float initMinWeight, float initMaxWeight, unsigned long seed, bool normalize);
-
-        /*!
-        \brief Zero the hidden states.
-        */
-        void clearHiddenStates() {
-            int size = _hiddenStates.size();
-
-            _hiddenStates.clear();
-            _hiddenStates.assign(size, 0);
-        }
+        void create(int inputWidth, int inputHeight, int hiddenWidth, int hiddenHeight, int columnSize, int radius,
+            float initMinWeight, float initMaxWeight, 
+            unsigned long seed);
 
         /*!
         \brief Activate the encoder from an input (compute hidden states, perform encoding).
         \param input input vector/image.
         \param cs compute system to be used.
-        \param useDistanceMetric whether to activate based on euclidean distance (true) or dot product (false). Defaults to true.
         */
-        const std::vector<int> &activate(const std::vector<float> &input, ComputeSystem &cs, bool useDistanceMetric = true);
+        const std::vector<int> &activate(ComputeSystem &cs, const std::vector<float> &inputs);
 
         /*!
         \brief Reconstruct (reverse) an encoding.
-        \param hiddenStates hidden state vector in chunked format.
+        \param hiddenStates hidden state vector in columnar format.
         \param cs compute system to be used.
         \return reconstructed vector.
         */
-        const std::vector<float> &reconstruct(const std::vector<int> &hiddenStates, ComputeSystem &cs);
+        const std::vector<float> &reconstruct(ComputeSystem &cs, const std::vector<int> &hiddenStates);
 
         /*!
         \brief Experimental learning functionality.
         Requires that reconstruct(...) has been called, without another call to activate(...).
         \param alpha weight learning rate.
-        \param gamma bias learning rate.
         \param cs compute system to be used.
         */
-        void learn(float alpha, float gamma, ComputeSystem &cs);
+        void learn(ComputeSystem &cs, float alpha);
 
         //!@{
         /*!
@@ -173,8 +155,8 @@ namespace eogmaneo {
         /*!
         \brief Get (hidden) chunk size.
         */
-        int getChunkSize() const {
-            return _chunkSize;
+        int getColumnSize() const {
+            return _columnSize;
         }
 
         /*!
@@ -191,8 +173,8 @@ namespace eogmaneo {
             return _hiddenStates;
         }
 		
-		friend class RandomEncoderWorkItem;
-		friend class RandomDecoderWorkItem;
-        friend class RandomLearnWorkItem;
+		friend class KMeansEncoderActivateWorkItem;
+		friend class KMeansEncoderReconstructWorkItem;
+        friend class KMeansEncoderLearnWorkItem;
     };
 }

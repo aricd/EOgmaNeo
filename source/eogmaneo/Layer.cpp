@@ -1,6 +1,6 @@
 // ----------------------------------------------------------------------------
 //  EOgmaNeo
-//  Copyright(c) 2017 Ogma Intelligent Systems Corp. All rights reserved.
+//  Copyright(c) 2017-2018 Ogma Intelligent Systems Corp. All rights reserved.
 //
 //  This copy of EOgmaNeo is licensed to you under the terms described
 //  in the EOGMANEO_LICENSE.md file included in this distribution.
@@ -9,6 +9,8 @@
 #include "Layer.h"
 
 #include <algorithm>
+#include <thread>
+#include <future>
 #include <iostream>
 
 #include <assert.h>
@@ -19,745 +21,397 @@ float eogmaneo::sigmoid(float x) {
     return 1.0f / (1.0f + std::exp(-x));
 }
 
-void ForwardWorkItem::run(size_t threadIndex) {
-    assert(_pLayer != nullptr);
+void LayerForwardWorkItem::run(size_t threadIndex) {
+	_pLayer->columnForward(_ci);
+}
 
-    int hiddenChunkSize = _pLayer->_chunkSize;
+void LayerBackwardWorkItem::run(size_t threadIndex) {
+	_pLayer->columnBackward(_ci, _v);
+}
 
-    int hiddenChunksInX = _pLayer->_hiddenWidth / hiddenChunkSize;
-    int hiddenChunksInY = _pLayer->_hiddenHeight / hiddenChunkSize;
+void Layer::columnForward(int ci) {
+    int hiddenColumnX = ci % _hiddenWidth;
+    int hiddenColumnY = ci / _hiddenWidth;
 
-    int hiddenChunkX = _hiddenChunkIndex % hiddenChunksInX;
-    int hiddenChunkY = _hiddenChunkIndex / hiddenChunksInX;
+    int hiddenStatePrev = _hiddenStatesPrev[ci];
 
-    int statePrev = _pLayer->_hiddenStatesPrev[_hiddenChunkIndex];
+    int hiddenCellIndexPrev = ci + hiddenStatePrev * _hiddenWidth * _hiddenHeight;
 
-    // Extract input views
-    std::vector<float> chunkActivations(hiddenChunkSize * hiddenChunkSize, 0.0f);
+    std::vector<float> columnActivations(_columnSize, 0.0f);
 
-    for (int v = 0; v < _pLayer->_visibleLayerDescs.size(); v++) {
-        int visibleChunkSize = _pLayer->_visibleLayerDescs[v]._chunkSize;
+    // Activate feed forward
+    for (int v = 0; v < _visibleLayerDescs.size(); v++) {
+        float toInputX = static_cast<float>(_visibleLayerDescs[v]._width) / static_cast<float>(_hiddenWidth);
+        float toInputY = static_cast<float>(_visibleLayerDescs[v]._height) / static_cast<float>(_hiddenHeight);
 
-        int visibleChunksInX = _pLayer->_visibleLayerDescs[v]._width / visibleChunkSize;
-        int visibleChunksInY = _pLayer->_visibleLayerDescs[v]._height / visibleChunkSize;
+        int visibleCenterX = hiddenColumnX * toInputX + 0.5f;
+        int visibleCenterY = hiddenColumnY * toInputY + 0.5f;
 
-        float toInputX = static_cast<float>(visibleChunksInX) / static_cast<float>(hiddenChunksInX);
-        float toInputY = static_cast<float>(visibleChunksInY) / static_cast<float>(hiddenChunksInY);
+        int forwardRadius = _visibleLayerDescs[v]._forwardRadius;
 
-        int visibleChunkCenterX = (hiddenChunkX + 0.5f) * toInputX;
-        int visibleChunkCenterY = (hiddenChunkY + 0.5f) * toInputY;
+        int forwardDiam = forwardRadius * 2 + 1;
 
-        int visibleCenterX = (visibleChunkCenterX + 0.5f) * visibleChunkSize;
-        int visibleCenterY = (visibleChunkCenterY + 0.5f) * visibleChunkSize;
+        int forwardSize = forwardDiam * forwardDiam;
 
-        int spatialVisibleRadius = _pLayer->_visibleLayerDescs[v]._forwardRadius;
+        int lowerVisibleX = visibleCenterX - forwardRadius;
+        int lowerVisibleY = visibleCenterY - forwardRadius;
 
-        int spatialVisibleDiam = spatialVisibleRadius * 2 + 1;
+        for (int dcx = -forwardRadius; dcx <= forwardRadius; dcx++)
+            for (int dcy = -forwardRadius; dcy <= forwardRadius; dcy++) {
+                int cx = visibleCenterX + dcx;
+                int cy = visibleCenterY + dcy;
 
-        int spatialChunkRadius = std::ceil(static_cast<float>(spatialVisibleRadius) / static_cast<float>(visibleChunkSize));
+                if (cx >= 0 && cx < _visibleLayerDescs[v]._width && cy >= 0 && cy < _visibleLayerDescs[v]._height) {
+                    int visibleColumnIndex = cx + cy * _visibleLayerDescs[v]._width;
 
-        int lowerVisibleX = visibleCenterX - spatialVisibleRadius;
-        int lowerVisibleY = visibleCenterY - spatialVisibleRadius;
+                    int inputIndex = _inputs[v][visibleColumnIndex];
+                    int inputIndexPrev = _inputsPrev[v][visibleColumnIndex];
 
-        int upperVisibleX = visibleCenterX + spatialVisibleRadius;
-        int upperVisibleY = visibleCenterY + spatialVisibleRadius;
+                    if (_codeIter == 0 && _learn && !_reconsActLearn.empty()) {
+                        // Input cells
+                        for (int c = 0; c < _visibleLayerDescs[v]._columnSize; c++) {
+                            int wi = (cx - lowerVisibleX) + (cy - lowerVisibleY) * forwardDiam + c * forwardSize;
 
-        for (int dcx = -spatialChunkRadius; dcx <= spatialChunkRadius; dcx++)
-            for (int dcy = -spatialChunkRadius; dcy <= spatialChunkRadius; dcy++) {
-                int cx = visibleChunkCenterX + dcx;
-                int cy = visibleChunkCenterY + dcy;
+                            int visibleCellIndex = visibleColumnIndex + c * _visibleLayerDescs[v]._width * _visibleLayerDescs[v]._height;
 
-                if (cx >= 0 && cx < visibleChunksInX && cy >= 0 && cy < visibleChunksInY) {
-                    int visibleChunkIndex = cx + cy * visibleChunksInX;
+                            float recon = _reconsActLearn[v][visibleCellIndex] / std::max(1.0f, _reconCountsActLearn[v][visibleCellIndex]);
 
-                    int maxIndex = _pLayer->_inputs[v][visibleChunkIndex];
+                            float target = c == inputIndexPrev ? 1.0f : 0.0f;
 
-                    int mdx = maxIndex % visibleChunkSize;
-                    int mdy = maxIndex / visibleChunkSize;
+                            _feedForwardWeights[v][hiddenCellIndexPrev][wi] = std::max(0.0f, _feedForwardWeights[v][hiddenCellIndexPrev][wi] + _alpha * std::min(0.0f, target - recon));
+                        }
+                    }
 
-                    int vx = cx * visibleChunkSize + mdx;
-                    int vy = cy * visibleChunkSize + mdy;
+                    // Output cells
+                    if (_codeIter == 0) {
+                        int wi = (cx - lowerVisibleX) + (cy - lowerVisibleY) * forwardDiam + inputIndex * forwardSize;
 
-                    if (vx >= lowerVisibleX && vx <= upperVisibleX && vy >= lowerVisibleY && vy <= upperVisibleY) {
-                        for (int c = 0; c < chunkActivations.size(); c++) {
-                            int dhx = c % hiddenChunkSize;
-                            int dhy = c / hiddenChunkSize;
+                        for (int c = 0; c < _columnSize; c++) {
+                            int hiddenCellIndex = ci + c * _hiddenWidth * _hiddenHeight;
+                            
+                            columnActivations[c] += _feedForwardWeights[v][hiddenCellIndex][wi];
+                        }
+                    }
+                    else {
+                        int wi = (cx - lowerVisibleX) + (cy - lowerVisibleY) * forwardDiam + inputIndex * forwardSize;
 
-                            int hIndex = (hiddenChunkX * hiddenChunkSize + dhx) + (hiddenChunkY * hiddenChunkSize + dhy) * _pLayer->_hiddenWidth;
+                        int visibleCellIndex = visibleColumnIndex + inputIndex * _visibleLayerDescs[v]._width * _visibleLayerDescs[v]._height;
 
-                            int i = v + _pLayer->_visibleLayerDescs.size() * hIndex;
-                        
-                            int wi = (vx - lowerVisibleX) + (vy - lowerVisibleY) * spatialVisibleDiam;
+                        float recon = _reconsActLearn[v][visibleCellIndex] / std::max(1.0f, _reconCountsActLearn[v][visibleCellIndex]);
 
-                            chunkActivations[c] += _pLayer->_feedForwardWeights[i][wi];
-                        }                 
+                        for (int c = 0; c < _columnSize; c++) {
+                            int hiddenCellIndex = ci + c * _hiddenWidth * _hiddenHeight;
+                            
+                            columnActivations[c] += _feedForwardWeights[v][hiddenCellIndex][wi] * std::max(0.0f, 1.0f - recon);
+                        }
                     }
                 }
             }
     }
-    
-	// Find max element
-	int maxHiddenIndex = 0;
 
-	for (int c = 1; c < chunkActivations.size(); c++) {
-		if (chunkActivations[c] > chunkActivations[maxHiddenIndex])
-			maxHiddenIndex = c;
+	// Find max element
+	int maxCellIndex = 0;
+    float maxValue = -99999.0f;
+
+	for (int c = 0; c < _columnSize; c++) {
+        int hiddenCellIndex = ci + c * _hiddenWidth * _hiddenHeight;
+
+        if (_codeIter == 0)
+            _hiddenActivations[hiddenCellIndex] = columnActivations[c];
+        else
+            _hiddenActivations[hiddenCellIndex] += columnActivations[c];
+
+		if (_hiddenActivations[hiddenCellIndex] > maxValue) {
+            maxValue = _hiddenActivations[hiddenCellIndex];
+			maxCellIndex = c;
+        }
 	}
 
-    _pLayer->_hiddenStates[_hiddenChunkIndex] = maxHiddenIndex;
+    _hiddenStates[ci] = maxCellIndex;
 
-    if (_pLayer->_alpha != 0.0f) {
-        int hIndexMax;
+    int hiddenCellIndex = ci + maxCellIndex * _hiddenWidth * _hiddenHeight;
 
-        {
-            int c = maxHiddenIndex;
-            
-            int dhx = c % hiddenChunkSize;
-            int dhy = c / hiddenChunkSize;
+    // Reconstruct
+    for (int v = 0; v < _visibleLayerDescs.size(); v++) {
+        float toInputX = static_cast<float>(_visibleLayerDescs[v]._width) / static_cast<float>(_hiddenWidth);
+        float toInputY = static_cast<float>(_visibleLayerDescs[v]._height) / static_cast<float>(_hiddenHeight);
 
-            hIndexMax = (hiddenChunkX * hiddenChunkSize + dhx) + (hiddenChunkY * hiddenChunkSize + dhy) * _pLayer->_hiddenWidth;
-        }
+        int visibleCenterX = hiddenColumnX * toInputX + 0.5f;
+        int visibleCenterY = hiddenColumnY * toInputY + 0.5f;
 
-        for (int v = 0; v < _pLayer->_visibleLayerDescs.size(); v++) {
-            int visibleChunkSize = _pLayer->_visibleLayerDescs[v]._chunkSize;
+        int forwardRadius = _visibleLayerDescs[v]._forwardRadius;
 
-            int visibleChunksInX = _pLayer->_visibleLayerDescs[v]._width / visibleChunkSize;
-            int visibleChunksInY = _pLayer->_visibleLayerDescs[v]._height / visibleChunkSize;
+        int forwardDiam = forwardRadius * 2 + 1;
 
-            float toInputX = static_cast<float>(visibleChunksInX) / static_cast<float>(hiddenChunksInX);
-            float toInputY = static_cast<float>(visibleChunksInY) / static_cast<float>(hiddenChunksInY);
+        int forwardSize = forwardDiam * forwardDiam;
 
-            int visibleChunkCenterX = (hiddenChunkX + 0.5f) * toInputX;
-            int visibleChunkCenterY = (hiddenChunkY + 0.5f) * toInputY;
+        int lowerVisibleX = visibleCenterX - forwardRadius;
+        int lowerVisibleY = visibleCenterY - forwardRadius;
 
-            int visibleCenterX = (visibleChunkCenterX + 0.5f) * visibleChunkSize;
-            int visibleCenterY = (visibleChunkCenterY + 0.5f) * visibleChunkSize;
+        for (int dcx = -forwardRadius; dcx <= forwardRadius; dcx++)
+            for (int dcy = -forwardRadius; dcy <= forwardRadius; dcy++) {
+                int cx = visibleCenterX + dcx;
+                int cy = visibleCenterY + dcy;
 
-            int spatialVisibleRadius = _pLayer->_visibleLayerDescs[v]._forwardRadius;
+                if (cx >= 0 && cx < _visibleLayerDescs[v]._width && cy >= 0 && cy < _visibleLayerDescs[v]._height) {
+                    int visibleColumnIndex = cx + cy * _visibleLayerDescs[v]._width;
 
-            int spatialVisibleDiam = spatialVisibleRadius * 2 + 1;
+                    // Input cells
+                    for (int c = 0; c < _visibleLayerDescs[v]._columnSize; c++) {
+                        int wi = (cx - lowerVisibleX) + (cy - lowerVisibleY) * forwardDiam + c * forwardSize;
 
-            int spatialChunkRadius = std::ceil(static_cast<float>(spatialVisibleRadius) / static_cast<float>(visibleChunkSize));
+                        int visibleCellIndex = visibleColumnIndex + c * _visibleLayerDescs[v]._width * _visibleLayerDescs[v]._height;
 
-            int lowerVisibleX = visibleCenterX - spatialVisibleRadius;
-            int lowerVisibleY = visibleCenterY - spatialVisibleRadius;
-
-            int upperVisibleX = visibleCenterX + spatialVisibleRadius;
-            int upperVisibleY = visibleCenterY + spatialVisibleRadius;
-
-            int i = v + _pLayer->_visibleLayerDescs.size() * hIndexMax;
-
-            for (int dcx = -spatialChunkRadius; dcx <= spatialChunkRadius; dcx++)
-                for (int dcy = -spatialChunkRadius; dcy <= spatialChunkRadius; dcy++) {
-                    int cx = visibleChunkCenterX + dcx;
-                    int cy = visibleChunkCenterY + dcy;
-
-                    if (cx >= 0 && cx < visibleChunksInX && cy >= 0 && cy < visibleChunksInY) {
-                        int visibleChunkIndex = cx + cy * visibleChunksInX;
-
-                        int maxIndex = _pLayer->_inputs[v][visibleChunkIndex];
-                        
-                        // Reduce weight on all 0 inputs
-                        for (int dvx = 0; dvx < visibleChunkSize; dvx++)
-                            for (int dvy = 0; dvy < visibleChunkSize; dvy++) {
-                                int index = dvx + dvy * visibleChunkSize;
-
-                                if (index != maxIndex) {
-                                    int ovx = cx * visibleChunkSize + dvx;
-                                    int ovy = cy * visibleChunkSize + dvy;
-                                    
-                                    if (ovx >= lowerVisibleX && ovx <= upperVisibleX && ovy >= lowerVisibleY && ovy <= upperVisibleY) {
-                                        int wi = (ovx - lowerVisibleX) + (ovy - lowerVisibleY) * spatialVisibleDiam;
-
-                                        _pLayer->_feedForwardWeights[i][wi] = std::max(0.0f, _pLayer->_feedForwardWeights[i][wi] - _pLayer->_alpha);
-                                    }
-                                }
-                            }
+                        _recons[v][visibleCellIndex] += _feedForwardWeights[v][hiddenCellIndex][wi];
+                        _reconCounts[v][visibleCellIndex] += 1.0f;
                     }
                 }
-        }
+            }
     }
 }
 
-void BackwardWorkItem::run(size_t threadIndex) {
-    assert(_pLayer != nullptr);
+void Layer::columnBackward(int ci, int v) {
+    int visibleWidth = _visibleLayerDescs[v]._width;
+    int visibleHeight = _visibleLayerDescs[v]._height;
 
-    int v = _visibleLayerIndex;
-    
-    if (!_pLayer->_visibleLayerDescs[v]._predict)
-        return;
+    int visibleColumnX = ci % visibleWidth;
+    int visibleColumnY = ci / visibleWidth;
 
-    int visibleWidth = _pLayer->_visibleLayerDescs[v]._width;
-    int visibleHeight = _pLayer->_visibleLayerDescs[v]._height;
-
-    int visibleChunkSize = _pLayer->_visibleLayerDescs[v]._chunkSize;
-
-    int hiddenChunkSize = _pLayer->_chunkSize;
-
-    int visibleChunksInX = visibleWidth / visibleChunkSize;
-    int visibleChunksInY = visibleHeight / visibleChunkSize;
-
-    int visibleChunkX = _visibleChunkIndex % visibleChunksInX;
-    int visibleChunkY = _visibleChunkIndex / visibleChunksInX;
-
-    int hiddenChunksInX = _pLayer->_hiddenWidth / hiddenChunkSize;
-    int hiddenChunksInY = _pLayer->_hiddenHeight / hiddenChunkSize;
+    int visibleColumnSize = _visibleLayerDescs[v]._columnSize;
 
     // Extract input views
-    std::vector<float> chunkActivations(visibleChunkSize * visibleChunkSize, 0.0f);
+    std::vector<float> columnActivations(visibleColumnSize, 0.0f);
+    std::vector<float> columnActivationsPrev(visibleColumnSize, 0.0f);
 
-    int spatialHiddenRadius = _pLayer->_visibleLayerDescs[v]._backwardRadius;
+    int backwardRadius = _visibleLayerDescs[v]._backwardRadius;
 
-    int spatialHiddenDiam = spatialHiddenRadius * 2 + 1;
+    int backwardDiam = backwardRadius * 2 + 1;
+    int backwardSize = backwardDiam * backwardDiam;
+    int backwardVecSize = backwardSize * _columnSize;
 
-    int spatialChunkRadius = std::ceil(static_cast<float>(spatialHiddenRadius) / static_cast<float>(hiddenChunkSize));
+    float toInputX = static_cast<float>(_hiddenWidth) / static_cast<float>(visibleWidth);
+    float toInputY = static_cast<float>(_hiddenHeight) / static_cast<float>(visibleHeight);
 
-    float toInputX = static_cast<float>(hiddenChunksInX) / static_cast<float>(visibleChunksInX);
-    float toInputY = static_cast<float>(hiddenChunksInY) / static_cast<float>(visibleChunksInY);
+    int hiddenCenterX = visibleColumnX * toInputX + 0.5f;
+    int hiddenCenterY = visibleColumnY * toInputY + 0.5f;
 
-    int hiddenChunkCenterX = (visibleChunkX + 0.5f) * toInputX;
-    int hiddenChunkCenterY = (visibleChunkY + 0.5f) * toInputY;
+    int lowerHiddenX = hiddenCenterX - backwardRadius;
+    int lowerHiddenY = hiddenCenterY - backwardRadius;
 
-    int hiddenCenterX = (hiddenChunkCenterX + 0.5f) * hiddenChunkSize;
-    int hiddenCenterY = (hiddenChunkCenterY + 0.5f) * hiddenChunkSize;
+    for (int dcx = -backwardRadius; dcx <= backwardRadius; dcx++)
+        for (int dcy = -backwardRadius; dcy <= backwardRadius; dcy++) {
+            int cx = hiddenCenterX + dcx;
+            int cy = hiddenCenterY + dcy;
 
-    int lowerHiddenX = hiddenCenterX - spatialHiddenRadius;
-    int lowerHiddenY = hiddenCenterY - spatialHiddenRadius;
+            if (cx >= 0 && cx < _hiddenWidth && cy >= 0 && cy < _hiddenHeight) {
+                int hiddenColumnIndex = cx + cy * _hiddenWidth;
 
-    int upperHiddenX = hiddenCenterX + spatialHiddenRadius;
-    int upperHiddenY = hiddenCenterY + spatialHiddenRadius;
+                if (!_feedBack.empty() && !_feedBackPrev.empty()) {
+                    int feedBackIndex = _feedBack[hiddenColumnIndex];
+                    int feedBackIndexPrev = _feedBackPrev[hiddenColumnIndex];
 
-    // For each feedback layer
-    for (int dcx = -spatialChunkRadius; dcx <= spatialChunkRadius; dcx++)
-        for (int dcy = -spatialChunkRadius; dcy <= spatialChunkRadius; dcy++) {
-            int cx = hiddenChunkCenterX + dcx;
-            int cy = hiddenChunkCenterY + dcy;
+                    // Output cells
+                    int wiCur = (cx - lowerHiddenX) + (cy - lowerHiddenY) * backwardDiam + feedBackIndex * backwardSize;
+                    int wiPrev = (cx - lowerHiddenX) + (cy - lowerHiddenY) * backwardDiam + feedBackIndexPrev * backwardSize;
 
-            if (cx >= 0 && cx < hiddenChunksInX && cy >= 0 && cy < hiddenChunksInY) {
-                int hiddenChunkIndex = cx + cy * hiddenChunksInX;
-
-                for (int f = 0; f < _pLayer->_feedBack.size(); f++) {
-                    int maxIndex = _pLayer->_feedBack[f][hiddenChunkIndex];
-                    int maxIndexPrev = _pLayer->_feedBackPrev[f][hiddenChunkIndex];
-
-                    int mdx = maxIndex % hiddenChunkSize;
-                    int mdy = maxIndex / hiddenChunkSize;
-
-                    int mdxPrev = maxIndexPrev % hiddenChunkSize;
-                    int mdyPrev = maxIndexPrev / hiddenChunkSize;
-                    
-                    int hx = cx * hiddenChunkSize + mdx;
-                    int hy = cy * hiddenChunkSize + mdy;
-
-                    int hxPrev = cx * hiddenChunkSize + mdxPrev;
-                    int hyPrev = cy * hiddenChunkSize + mdyPrev;
-                    
-                    if (hx >= lowerHiddenX && hx <= upperHiddenX && hy >= lowerHiddenY && hy <= upperHiddenY) {
-                        for (int c = 0; c < chunkActivations.size(); c++) {
-                            int dvx = c % visibleChunkSize;
-                            int dvy = c / visibleChunkSize;
-
-                            int vIndex = (visibleChunkX * visibleChunkSize + dvx) + (visibleChunkY * visibleChunkSize + dvy) * visibleWidth;
-
-                            int i = f + _pLayer->_feedBack.size() * vIndex;
-
-                            int wi = (hx - lowerHiddenX) + (hy - lowerHiddenY) * spatialHiddenDiam;
-
-                            chunkActivations[c] += _pLayer->_feedBackWeights[v][i][wi];
-                        }
+                    for (int c = 0; c < visibleColumnSize; c++) {
+                        int visibleCellIndex = ci + c * visibleWidth * visibleHeight;
+                            
+                        columnActivations[c] += _feedBackWeights[v][visibleCellIndex][wiCur];
+                        columnActivationsPrev[c] += _feedBackWeights[v][visibleCellIndex][wiPrev];
                     }
                 }
-            }
-        }
-        
-    // Find max element
-    int predMaxIndex = 0;
-    
-    for (int c = 0; c < chunkActivations.size(); c++) {
-        int dvx = c % visibleChunkSize;
-        int dvy = c / visibleChunkSize;
 
-        int vIndex = (visibleChunkX * visibleChunkSize + dvx) + (visibleChunkY * visibleChunkSize + dvy) * visibleWidth;
-
-        _pLayer->_predictionActivations[v][vIndex] = chunkActivations[c];
-
-        if (chunkActivations[c] > chunkActivations[predMaxIndex])
-            predMaxIndex = c;
-    }
-    
-    std::uniform_real_distribution<float> dist01(0.0f, 1.0f);
-
-    if (_pLayer->_delta != 0.0f && dist01(_rng) < _pLayer->_epsilon) {
-        std::uniform_int_distribution<int> chunkDist(0, chunkActivations.size() - 1);
-
-        _pLayer->_predictions[v][_visibleChunkIndex] = chunkDist(_rng);
-    }
-    else
-        _pLayer->_predictions[v][_visibleChunkIndex] = predMaxIndex;
-
-    int vIndexPredPrev;
-
-    {
-        int c = _pLayer->_predictionsPrev[v][_visibleChunkIndex];
-
-        int dvx = c % visibleChunkSize;
-        int dvy = c / visibleChunkSize;
-
-        vIndexPredPrev = (visibleChunkX * visibleChunkSize + dvx) + (visibleChunkY * visibleChunkSize + dvy) * visibleWidth;
-    }
-
-    for (int dcx = -spatialChunkRadius; dcx <= spatialChunkRadius; dcx++)
-        for (int dcy = -spatialChunkRadius; dcy <= spatialChunkRadius; dcy++) {
-            int cx = hiddenChunkCenterX + dcx;
-            int cy = hiddenChunkCenterY + dcy;
-
-            if (cx >= 0 && cx < hiddenChunksInX && cy >= 0 && cy < hiddenChunksInY) {
-                int hiddenChunkIndex = cx + cy * hiddenChunksInX;
-
-                for (int f = 0; f < _pLayer->_feedBack.size(); f++) {
-                    int maxIndexPrev = _pLayer->_feedBackPrev[f][hiddenChunkIndex];
-
-                    int mdxPrev = maxIndexPrev % hiddenChunkSize;
-                    int mdyPrev = maxIndexPrev / hiddenChunkSize;
-
-                    int hxPrev = cx * hiddenChunkSize + mdxPrev;
-                    int hyPrev = cy * hiddenChunkSize + mdyPrev;
-                    
-                    if (hxPrev >= lowerHiddenX && hxPrev <= upperHiddenX && hyPrev >= lowerHiddenY && hyPrev <= upperHiddenY) {
-                        for (int c = 0; c < chunkActivations.size(); c++) {
-                            int dvx = c % visibleChunkSize;
-                            int dvy = c / visibleChunkSize;
-
-                            int vIndex = (visibleChunkX * visibleChunkSize + dvx) + (visibleChunkY * visibleChunkSize + dvy) * visibleWidth;
-
-                            int i = f + _pLayer->_feedBack.size() * vIndex;
-
-                            int wi = (hxPrev - lowerHiddenX) + (hyPrev - lowerHiddenY) * spatialHiddenDiam;
-
-                            float target = c == _pLayer->_inputs[v][_visibleChunkIndex] ? 1.0f : 0.0f;
-
-                            float error = target - sigmoid(_pLayer->_predictionActivationsPrev[v][vIndex]);
-
-                            _pLayer->_feedBackWeights[v][i][wi] += _pLayer->_beta * error;
-
-                            // Spawn a trace
-                            if (c == _pLayer->_predictionsPrev[v][_visibleChunkIndex])
-                                _pLayer->_feedBackTraces[v][i][wi] = 1.0f;
-                        }
-                    }
-                }
-            }
-        }
-
-    float qNext = chunkActivations[_pLayer->_predictions[v][_visibleChunkIndex]];
-
-    //float qNextMax = chunkActivations[predMaxIndex];
-
-    float tdError = _pLayer->_reward + _pLayer->_gamma * qNext - _pLayer->_predictionActivationsPrev[v][vIndexPredPrev];
-
-    // Update traces
-    for (int c = 0; c < chunkActivations.size(); c++) {
-        int dvx = c % visibleChunkSize;
-        int dvy = c / visibleChunkSize;
-
-        int vIndex = (visibleChunkX * visibleChunkSize + dvx) + (visibleChunkY * visibleChunkSize + dvy) * visibleWidth;
-
-        for (int f = 0; f < _pLayer->_feedBack.size(); f++) {
-            int i = f + _pLayer->_feedBack.size() * vIndex;
-
-            for (std::unordered_map<int, float>::iterator it = _pLayer->_feedBackTraces[v][i].begin(); it != _pLayer->_feedBackTraces[v][i].end();) {
-                _pLayer->_feedBackWeights[v][i][it->first] += _pLayer->_delta * tdError * it->second;
+                int hiddenIndex = _hiddenStates[hiddenColumnIndex];
+                int hiddenIndexPrev = _hiddenStatesPrev[hiddenColumnIndex];
                 
-                it->second *= _pLayer->_gamma;
+                int wiCur = (cx - lowerHiddenX) + (cy - lowerHiddenY) * backwardDiam + hiddenIndex * backwardSize;
+                int wiPrev = (cx - lowerHiddenX) + (cy - lowerHiddenY) * backwardDiam + hiddenIndexPrev * backwardSize;
 
-                if (it->second < _pLayer->_traceCutoff)
-                    it = _pLayer->_feedBackTraces[v][i].erase(it);
-                else
-                    it++;
+                // Output cells
+                for (int c = 0; c < visibleColumnSize; c++) {
+                    int visibleCellIndex = ci + c * visibleWidth * visibleHeight;
+        
+                    columnActivations[c] += _feedBackWeights[v][visibleCellIndex][wiCur + backwardVecSize];
+                    columnActivationsPrev[c] += _feedBackWeights[v][visibleCellIndex][wiPrev + backwardVecSize];
+                }
             }
         }
+
+    int inputIndex = _inputs[v][ci];
+
+    std::vector<float> deltas(visibleColumnSize, 0.0f);
+    deltas[inputIndex] = 1.0f;
+
+    int predIndex = 0;
+
+    for (int c = 0; c < visibleColumnSize; c++) {
+        float s = sigmoid(columnActivationsPrev[c]);
+        deltas[c] -= s;
+        deltas[c] *= _beta;
+
+        if (columnActivations[c] > columnActivations[predIndex])
+            predIndex = c;
+    }
+ 
+    _predictions[v][ci] = predIndex;
+
+    if (_learn) {
+        for (int dcx = -backwardRadius; dcx <= backwardRadius; dcx++)
+            for (int dcy = -backwardRadius; dcy <= backwardRadius; dcy++) {
+                int cx = hiddenCenterX + dcx;
+                int cy = hiddenCenterY + dcy;
+
+                if (cx >= 0 && cx < _hiddenWidth && cy >= 0 && cy < _hiddenHeight) {
+                    int hiddenColumnIndex = cx + cy * _hiddenWidth;
+
+                    if (!_feedBackPrev.empty()) {
+                        int feedBackIndexPrev = _feedBackPrev[hiddenColumnIndex];
+
+                        int wiPrev = (cx - lowerHiddenX) + (cy - lowerHiddenY) * backwardDiam + feedBackIndexPrev * backwardSize;
+
+                        // Output cells
+                        for (int c = 0; c < visibleColumnSize; c++) {
+                            int visibleCellIndex = ci + c * visibleWidth * visibleHeight;
+
+                            _feedBackWeights[v][visibleCellIndex][wiPrev] += deltas[c];
+                        }
+                    }
+
+                    int hiddenIndexPrev = _hiddenStatesPrev[hiddenColumnIndex];
+                    
+                    int wiPrev = (cx - lowerHiddenX) + (cy - lowerHiddenY) * backwardDiam + hiddenIndexPrev * backwardSize;
+
+                    // Output cells
+                    for (int c = 0; c < visibleColumnSize; c++) {
+                        int visibleCellIndex = ci + c * visibleWidth * visibleHeight;
+
+                        _feedBackWeights[v][visibleCellIndex][wiPrev + backwardVecSize] += deltas[c];
+                    }
+                }
+            }
     }
 }
 
-void Layer::create(int hiddenWidth, int hiddenHeight, int chunkSize, bool hasFeedBack, const std::vector<VisibleLayerDesc> &visibleLayerDescs, unsigned long seed) {
+void Layer::create(int hiddenWidth, int hiddenHeight, int columnSize, const std::vector<VisibleLayerDesc> &visibleLayerDescs, unsigned long seed) {
     std::mt19937 rng(seed);
 
     _hiddenWidth = hiddenWidth;
     _hiddenHeight = hiddenHeight;
-    _chunkSize = chunkSize;
+    _columnSize = columnSize;
 
     _visibleLayerDescs = visibleLayerDescs;
 
-    _feedForwardWeights.resize(hiddenWidth * hiddenHeight * visibleLayerDescs.size());
-    _feedBackWeights.resize(visibleLayerDescs.size());
-    _feedBackTraces.resize(visibleLayerDescs.size());
-    
-    _predictionActivations.resize(visibleLayerDescs.size());
-    _predictionActivationsPrev.resize(visibleLayerDescs.size());
-
-    _predictions.resize(visibleLayerDescs.size());
-    _predictionsPrev.resize(visibleLayerDescs.size());
-
-    _inputs.resize(visibleLayerDescs.size());
-    _inputsPrev.resize(visibleLayerDescs.size());
-
-    int hiddenChunksInX = hiddenWidth / chunkSize;
-    int hiddenChunksInY = hiddenHeight / chunkSize;
-
-    _hiddenStates.resize(hiddenChunksInX * hiddenChunksInY, 0);
-    _hiddenStatesPrev.resize(hiddenChunksInX * hiddenChunksInY, 0);
-
-    int numFeedBack = hasFeedBack ? 2 : 1;
-
-    std::uniform_real_distribution<float> initWeightDistHigh(0.001f, 1.0f);
-    std::uniform_real_distribution<float> initWeightDistLow(-0.001f, 0.001f);
-    
-    for (int v = 0; v < visibleLayerDescs.size(); v++) {
-        _predictionActivations[v].resize(_visibleLayerDescs[v]._width * _visibleLayerDescs[v]._height, 0.0f);
-        _predictionActivationsPrev[v].resize(_visibleLayerDescs[v]._width * _visibleLayerDescs[v]._height, 0.0f);
-        
-        _predictions[v].resize((_visibleLayerDescs[v]._width / _visibleLayerDescs[v]._chunkSize) * (_visibleLayerDescs[v]._height / _visibleLayerDescs[v]._chunkSize), 0);
-        _predictionsPrev[v].resize((_visibleLayerDescs[v]._width / _visibleLayerDescs[v]._chunkSize) * (_visibleLayerDescs[v]._height / _visibleLayerDescs[v]._chunkSize), 0);
-
-        _inputs[v].resize((_visibleLayerDescs[v]._width / _visibleLayerDescs[v]._chunkSize) * (_visibleLayerDescs[v]._height / _visibleLayerDescs[v]._chunkSize), 0);
-        _inputsPrev[v].resize((_visibleLayerDescs[v]._width / _visibleLayerDescs[v]._chunkSize) * (_visibleLayerDescs[v]._height / _visibleLayerDescs[v]._chunkSize), 0);
-
-        int forwardVecSize = _visibleLayerDescs[v]._forwardRadius * 2 + 1;
-
-        forwardVecSize *= forwardVecSize;
-
-        for (int x = 0; x < hiddenWidth; x++)
-            for (int y = 0; y < hiddenHeight; y++) {
-                int hIndex = x + y * hiddenWidth;
-                
-                int i = v + visibleLayerDescs.size() * hIndex;
-
-                _feedForwardWeights[i].resize(forwardVecSize);
-
-                for (int j = 0; j < forwardVecSize; j++)
-                    _feedForwardWeights[i][j] = initWeightDistHigh(rng);
-            }
-
-        int backwardVecSize = _visibleLayerDescs[v]._backwardRadius * 2 + 1;
-
-        backwardVecSize *= backwardVecSize;
-
-        if (_visibleLayerDescs[v]._predict) {
-            _feedBackWeights[v].resize(_visibleLayerDescs[v]._width * _visibleLayerDescs[v]._height * numFeedBack);
-            _feedBackTraces[v].resize(_visibleLayerDescs[v]._width * _visibleLayerDescs[v]._height * numFeedBack);
-
-            for (int f = 0; f < numFeedBack; f++) {
-                for (int x = 0; x < visibleLayerDescs[v]._width; x++)
-                    for (int y = 0; y < visibleLayerDescs[v]._height; y++) {
-                        int vIndex = x + y * visibleLayerDescs[v]._width;
-                        
-                        int i = f + numFeedBack * vIndex;
-
-                        _feedBackWeights[v][i].resize(backwardVecSize);
-
-                        for (int j = 0; j < backwardVecSize; j++)
-                            _feedBackWeights[v][i][j] = initWeightDistLow(rng);
-                    }
-            }
-        }
-    }
-
-	_feedBack.resize(numFeedBack);
-	_feedBackPrev.resize(numFeedBack);
-
-	for (int f = 0; f < numFeedBack; f++) {
-		_feedBack[f].resize(hiddenChunksInX * hiddenChunksInY, 0);
-		_feedBackPrev[f].resize(hiddenChunksInX * hiddenChunksInY, 0);
-    }
-}
-
-void Layer::createFromStream(std::istream &s) {
-    s >> _hiddenWidth >> _hiddenHeight >> _chunkSize;
-
-    int numVisibleLayerDescs;
-    s >> numVisibleLayerDescs;
-
-    _visibleLayerDescs.resize(numVisibleLayerDescs);
-
-    for (int v = 0; v < numVisibleLayerDescs; v++) {
-        s >> _visibleLayerDescs[v]._width >> _visibleLayerDescs[v]._height >> _visibleLayerDescs[v]._chunkSize;
-        s >> _visibleLayerDescs[v]._forwardRadius >> _visibleLayerDescs[v]._backwardRadius;
-        s >> _visibleLayerDescs[v]._predict;
-    }
-
-    int numFeedForwardWeightSets;
-    s >> numFeedForwardWeightSets;
-
-    _feedForwardWeights.resize(numFeedForwardWeightSets);
+    _feedForwardWeights.resize(_visibleLayerDescs.size());
     _feedBackWeights.resize(_visibleLayerDescs.size());
-    _feedBackTraces.resize(_visibleLayerDescs.size());
-
-    _predictionActivations.resize(_visibleLayerDescs.size());
-    _predictionActivationsPrev.resize(_visibleLayerDescs.size());
-
-    _predictions.resize(_visibleLayerDescs.size());
-    _predictionsPrev.resize(_visibleLayerDescs.size());
 
     _inputs.resize(_visibleLayerDescs.size());
-    _inputsPrev.resize(_visibleLayerDescs.size());
 
-    int hiddenChunksInX = _hiddenWidth / _chunkSize;
-    int hiddenChunksInY = _hiddenHeight / _chunkSize;
+    _hiddenStates.resize(_hiddenWidth * _hiddenHeight, 0);
 
-    _hiddenStates.resize(hiddenChunksInX * hiddenChunksInY, 0);
-    _hiddenStatesPrev.resize(hiddenChunksInX * hiddenChunksInY, 0);
-    
-    // Load
-    for (int i = 0; i < _hiddenStates.size(); i++)
-        s >> _hiddenStates[i] >> _hiddenStatesPrev[i];
+    _hiddenActivations.resize(_hiddenWidth * _hiddenHeight * _columnSize, 0.0f);
 
-    bool hasFeedBack;
-    s >> hasFeedBack;
-
-    int numFeedBack = hasFeedBack ? 2 : 1;
+    std::uniform_real_distribution<float> initWeightDist(-0.001f, 0.001f);
 
     for (int v = 0; v < _visibleLayerDescs.size(); v++) {
-        _predictionActivations[v].resize(_visibleLayerDescs[v]._width * _visibleLayerDescs[v]._height);
-        _predictionActivationsPrev[v].resize(_visibleLayerDescs[v]._width * _visibleLayerDescs[v]._height);
-        
-        _predictions[v].resize((_visibleLayerDescs[v]._width / _visibleLayerDescs[v]._chunkSize) * (_visibleLayerDescs[v]._height / _visibleLayerDescs[v]._chunkSize));
-        _predictionsPrev[v].resize((_visibleLayerDescs[v]._width / _visibleLayerDescs[v]._chunkSize) * (_visibleLayerDescs[v]._height / _visibleLayerDescs[v]._chunkSize));
-
-        _inputs[v].resize((_visibleLayerDescs[v]._width / _visibleLayerDescs[v]._chunkSize) * (_visibleLayerDescs[v]._height / _visibleLayerDescs[v]._chunkSize));
-        _inputsPrev[v].resize((_visibleLayerDescs[v]._width / _visibleLayerDescs[v]._chunkSize) * (_visibleLayerDescs[v]._height / _visibleLayerDescs[v]._chunkSize));
-
-        // Load
-        for (int i = 0; i < _predictionActivations[v].size(); i++)
-            s >> _predictionActivations[v][i] >> _predictionActivationsPrev[v][i];
-
-        for (int i = 0; i < _predictions[v].size(); i++)
-            s >> _predictions[v][i] >> _predictionsPrev[v][i];
-
-        for (int i = 0; i < _inputs[v].size(); i++)
-            s >> _inputs[v][i] >> _inputsPrev[v][i];
+        _inputs[v].resize(_visibleLayerDescs[v]._width * _visibleLayerDescs[v]._height, 0);
 
         int forwardVecSize = _visibleLayerDescs[v]._forwardRadius * 2 + 1;
 
-        forwardVecSize *= forwardVecSize;
+        forwardVecSize *= forwardVecSize * _visibleLayerDescs[v]._columnSize;
+
+        _feedForwardWeights[v].resize(_hiddenWidth * _hiddenHeight * _columnSize);
 
         for (int x = 0; x < _hiddenWidth; x++)
-            for (int y = 0; y < _hiddenHeight; y++) {
-                int hIndex = x + y * _hiddenWidth;
-                
-                int i = v + _visibleLayerDescs.size() * hIndex;
+            for (int y = 0; y < _hiddenHeight; y++)
+                for (int c = 0; c < _columnSize; c++) {
+                    int hiddenCellIndex = x + y * _hiddenWidth + c * _hiddenWidth * _hiddenHeight;
 
-                _feedForwardWeights[i].resize(forwardVecSize);
-
-                for (int j = 0; j < forwardVecSize; j++)
-                    s >> _feedForwardWeights[i][j];
-            }
-
-        int backwardVecSize = _visibleLayerDescs[v]._backwardRadius * 2 + 1;
-
-        backwardVecSize *= backwardVecSize;
+                    _feedForwardWeights[v][hiddenCellIndex].resize(forwardVecSize);
+                    
+                    for (int j = 0; j < forwardVecSize; j++)
+                        _feedForwardWeights[v][hiddenCellIndex][j] = 1.0f + initWeightDist(rng);
+                }
 
         if (_visibleLayerDescs[v]._predict) {
-            _feedBackWeights[v].resize(_visibleLayerDescs[v]._width * _visibleLayerDescs[v]._height * numFeedBack);
-            _feedBackTraces[v].resize(_visibleLayerDescs[v]._width * _visibleLayerDescs[v]._height * numFeedBack);
+            _feedBackWeights[v].resize(_visibleLayerDescs[v]._width * _visibleLayerDescs[v]._height * _visibleLayerDescs[v]._columnSize);
 
-            for (int f = 0; f < numFeedBack; f++) {
-                for (int x = 0; x < _visibleLayerDescs[v]._width; x++)
-                    for (int y = 0; y < _visibleLayerDescs[v]._height; y++) {
-                        int vIndex = x + y * _visibleLayerDescs[v]._width;
+            int backwardVecSize = _visibleLayerDescs[v]._backwardRadius * 2 + 1;
+
+            backwardVecSize *= backwardVecSize * _columnSize * 2;
+
+            for (int x = 0; x < _visibleLayerDescs[v]._width; x++)
+                for (int y = 0; y < _visibleLayerDescs[v]._height; y++)         
+                    for (int c = 0; c < _visibleLayerDescs[v]._columnSize; c++) {
+                        int visibleCellIndex = x + y * _visibleLayerDescs[v]._width + c * _visibleLayerDescs[v]._width * _visibleLayerDescs[v]._height;
                         
-                        int i = f + numFeedBack * vIndex;
-
-                        _feedBackWeights[v][i].resize(backwardVecSize);
+                        _feedBackWeights[v][visibleCellIndex].resize(backwardVecSize);
 
                         for (int j = 0; j < backwardVecSize; j++)
-                            s >> _feedBackWeights[v][i][j];
-
-                        int numTraces;
-
-                        s >> numTraces;
-
-                        for (int j = 0; j < numTraces; j++) {
-                            int wi;
-                            float strength;
-
-                            s >> wi >> strength;
-
-                            _feedBackTraces[v][i][wi] = strength;
-                        }
+                            _feedBackWeights[v][visibleCellIndex][j] = initWeightDist(rng);
                     }
-            }
         }
     }
 
-	_feedBack.resize(numFeedBack);
-	_feedBackPrev.resize(numFeedBack);
+    _feedBackPrev = _feedBack = _hiddenStatesPrev = _hiddenStates;
 
-	for (int f = 0; f < numFeedBack; f++) {
-		_feedBack[f].resize(hiddenChunksInX * hiddenChunksInY, 0);
-		_feedBackPrev[f].resize(hiddenChunksInX * hiddenChunksInY, 0);
-
-        // Load
-        for (int i = 0; i < _feedBack[f].size(); i++)
-            s >> _feedBack[f][i] >> _feedBackPrev[f][i];
-    }
+    _predictions = _inputsPrev = _inputs;
 }
 
-void Layer::writeToStream(std::ostream &s) {
-    s << _hiddenWidth << " " << _hiddenHeight << " " << _chunkSize << std::endl;
-
-    s << _visibleLayerDescs.size() << std::endl;
-
-    for (int v = 0; v < _visibleLayerDescs.size(); v++) {
-        s << _visibleLayerDescs[v]._width << " " << _visibleLayerDescs[v]._height << " " << _visibleLayerDescs[v]._chunkSize << std::endl;
-        s << _visibleLayerDescs[v]._forwardRadius << " " << _visibleLayerDescs[v]._backwardRadius << std::endl;
-        s << _visibleLayerDescs[v]._predict << std::endl;
-    }
-
-    s << _feedForwardWeights.size() << std::endl;
-
-    int hiddenChunksInX = _hiddenWidth / _chunkSize;
-    int hiddenChunksInY = _hiddenHeight / _chunkSize;
-
-    // Save
-    for (int i = 0; i < _hiddenStates.size(); i++)
-        s << _hiddenStates[i] << " " << _hiddenStatesPrev[i] << " ";
-
-    s << std::endl;
-
-    s << (_feedBack.size() > 1) << std::endl;
-
-    int numFeedBack = _feedBack.size();
-
-    for (int v = 0; v < _visibleLayerDescs.size(); v++) {
-        // Save
-        for (int i = 0; i < _predictionActivations[v].size(); i++)
-            s << _predictionActivations[v][i] << " " << _predictionActivationsPrev[v][i] << " ";
-
-        s << std::endl;
-
-        for (int i = 0; i < _predictions[v].size(); i++)
-            s << _predictions[v][i] << " " << _predictionsPrev[v][i] << " ";
-
-        s << std::endl;
-
-        for (int i = 0; i < _inputs[v].size(); i++)
-            s << _inputs[v][i] << " " << _inputsPrev[v][i] <<  " ";
-
-        s << std::endl;
-
-        int forwardVecSize = _visibleLayerDescs[v]._forwardRadius * 2 + 1;
-
-        forwardVecSize *= forwardVecSize;
-
-        for (int x = 0; x < _hiddenWidth; x++)
-            for (int y = 0; y < _hiddenHeight; y++) {
-                int hIndex = x + y * _hiddenWidth;
-                
-                int i = v + _visibleLayerDescs.size() * hIndex;
-
-                for (int j = 0; j < forwardVecSize; j++)
-                    s << _feedForwardWeights[i][j] << " ";
-
-                s << std::endl;
-            }
-
-        int backwardVecSize = _visibleLayerDescs[v]._backwardRadius * 2 + 1;
-
-        backwardVecSize *= backwardVecSize;
-
-        if (_visibleLayerDescs[v]._predict) {
-            for (int f = 0; f < numFeedBack; f++) {
-                for (int x = 0; x < _visibleLayerDescs[v]._width; x++)
-                    for (int y = 0; y < _visibleLayerDescs[v]._height; y++) {
-                        int vIndex = x + y * _visibleLayerDescs[v]._width;
-                        
-                        int i = f + numFeedBack * vIndex;
-
-                        for (int j = 0; j < backwardVecSize; j++)
-                            s << _feedBackWeights[v][i][j] << " ";
-
-                        s << std::endl;
-
-                        s << _feedBackTraces[v][i].size() << std::endl;
-
-                        for (std::unordered_map<int, float>::const_iterator cit = _feedBackTraces[v][i].begin(); cit != _feedBackTraces[v][i].end(); cit++)
-                            s << cit->first << " " << cit->second << " ";
-
-                        s << std::endl;
-                    }
-            }
-        }
-    }
-
-	for (int f = 0; f < numFeedBack; f++) {
-        // Load
-        for (int i = 0; i < _feedBack[f].size(); i++)
-            s << _feedBack[f][i] << " " << _feedBackPrev[f][i] << " ";
-
-        s << std::endl;
-    }
-}
-
-void Layer::forward(const std::vector<std::vector<int>> &inputs, ComputeSystem &cs, float alpha) {
+void Layer::forward(ComputeSystem &cs, const std::vector<std::vector<int>> &inputs, bool learn) {
     _inputsPrev = _inputs;
     _inputs = inputs;
 
+    _learn = learn;
+
     _hiddenStatesPrev = _hiddenStates;
 
-	_alpha = alpha;
+    // Several inhibition iterations
+    for (int it = 0; it < _codeIters; it++) {
+        _codeIter = it;
 
-    int chunksInX = _hiddenWidth / _chunkSize;
-    int chunksInY = _hiddenHeight / _chunkSize;
+        // Clear recons
+        _recons.clear();
+        _recons.resize(_visibleLayerDescs.size());
 
-    int numChunks = chunksInX * chunksInY;
+        for (int v = 0; v < _visibleLayerDescs.size(); v++)
+            _recons[v].resize(_visibleLayerDescs[v]._width * _visibleLayerDescs[v]._height * _visibleLayerDescs[v]._columnSize, 0.0f);
+        
+        _reconCounts = _recons;
 
-    std::uniform_int_distribution<int> seedDist(0, 99999);
+        for (int ci = 0; ci < _hiddenStates.size(); ci++) {
+            std::shared_ptr<LayerForwardWorkItem> item = std::make_shared<LayerForwardWorkItem>();
 
-    // Queue tasks
-    for (int i = 0; i < numChunks; i++) {
-        std::shared_ptr<ForwardWorkItem> item = std::make_shared<ForwardWorkItem>();
+            item->_pLayer = this;
+            item->_ci = ci;
 
-        item->_hiddenChunkIndex = i;
-        item->_pLayer = this;
-        item->_rng.seed(seedDist(cs._rng));
-			
-        cs._pool.addItem(item);
+            cs._pool.addItem(item);
+        }
+        
+        cs._pool.wait();
+
+        _reconsActLearn = _recons;
+        _reconCountsActLearn = _reconCounts;
     }
-
-    cs._pool.wait();
 }
 
-void Layer::backward(const std::vector<std::vector<int>> &feedBack, ComputeSystem &cs, float reward, float beta, float delta, float gamma, float traceCutoff, float epsilon) {
+void Layer::backward(ComputeSystem &cs, const std::vector<int> &feedBack, bool learn) {
     _feedBackPrev = _feedBack;
 	_feedBack = feedBack;
 
-    _predictionActivationsPrev = _predictionActivations;
-    _predictionsPrev = _predictions;
-    
-    _reward = reward;
-    _beta = beta;
-    _delta = delta;
-    _gamma = gamma;
-    _traceCutoff = traceCutoff;
-    _epsilon = epsilon;
-    
-    std::uniform_int_distribution<int> seedDist(0, 99999);
+    _learn = learn;
 
     for (int v = 0; v < _visibleLayerDescs.size(); v++) {
-        int chunksInX = _visibleLayerDescs[v]._width / _visibleLayerDescs[v]._chunkSize;
-        int chunksInY = _visibleLayerDescs[v]._height / _visibleLayerDescs[v]._chunkSize;
+        if (!_visibleLayerDescs[v]._predict)
+            continue;
 
-        int numChunks = chunksInX * chunksInY;
+        for (int ci = 0; ci < _predictions[v].size(); ci++) {
+            std::shared_ptr<LayerBackwardWorkItem> item = std::make_shared<LayerBackwardWorkItem>();
 
-        // Queue tasks
-        for (int i = 0; i < numChunks; i++) {
-            std::shared_ptr<BackwardWorkItem> item = std::make_shared<BackwardWorkItem>();
-
-            item->_visibleChunkIndex = i;
-            item->_visibleLayerIndex = v;
             item->_pLayer = this;
-            item->_rng.seed(seedDist(cs._rng));
-			
+            item->_ci = ci;
+            item->_v = v;
+
             cs._pool.addItem(item);
         }
     }
@@ -765,104 +419,159 @@ void Layer::backward(const std::vector<std::vector<int>> &feedBack, ComputeSyste
     cs._pool.wait();
 }
 
-std::vector<float> Layer::getFeedBackWeights(int v, int f, int x, int y) const {
-    std::vector<float> weights;
+void Layer::readFromStream(std::istream &is) {
+    // Read header
+    is.read(reinterpret_cast<char*>(&_hiddenWidth), sizeof(int));
+    is.read(reinterpret_cast<char*>(&_hiddenHeight), sizeof(int));
+    is.read(reinterpret_cast<char*>(&_columnSize), sizeof(int));
 
-    // Reverse project
-    int hIndex = x + y * _hiddenWidth;
+    // Read hyperparameters
+    is.read(reinterpret_cast<char*>(&_alpha), sizeof(float));
+    is.read(reinterpret_cast<char*>(&_beta), sizeof(float));
+    is.read(reinterpret_cast<char*>(&_codeIters), sizeof(int));
 
-    int hiddenChunkSize = _chunkSize;
-    
-    int visibleBitsPerChunk = _visibleLayerDescs[v]._chunkSize * _visibleLayerDescs[v]._chunkSize;
+    int numVisibleLayerDescs;
 
-    int hiddenChunksInX = _hiddenWidth / hiddenChunkSize;
-    int hiddenChunksInY = _hiddenHeight / hiddenChunkSize;
+    is.read(reinterpret_cast<char*>(&numVisibleLayerDescs), sizeof(int));
 
-    int hiddenChunkX = x / hiddenChunksInX;
-    int hiddenChunkY = y / hiddenChunksInY;
+    _visibleLayerDescs.resize(numVisibleLayerDescs);
 
-    // Project unit
-    int visibleChunkSize = _visibleLayerDescs[v]._chunkSize;
+    is.read(reinterpret_cast<char*>(_visibleLayerDescs.data()), _visibleLayerDescs.size() * sizeof(VisibleLayerDesc));
 
-    int visibleChunksInX = _visibleLayerDescs[v]._width / visibleChunkSize;
-    int visibleChunksInY = _visibleLayerDescs[v]._height / visibleChunkSize;
+    _inputs.resize(_visibleLayerDescs.size());
+    _inputsPrev.resize(_visibleLayerDescs.size());
+    _predictions.resize(_visibleLayerDescs.size());
 
-    float toInputX1 = static_cast<float>(visibleChunksInX) / static_cast<float>(hiddenChunksInX);
-    float toInputY1 = static_cast<float>(visibleChunksInY) / static_cast<float>(hiddenChunksInY);
+    _feedForwardWeights.resize(_visibleLayerDescs.size());
+    _feedBackWeights.resize(_visibleLayerDescs.size());
+   
+    // Hidden data
+    _hiddenStates.resize(_hiddenWidth * _hiddenHeight);
+    _hiddenStatesPrev.resize(_hiddenStates.size());
+    _feedBack.resize(_hiddenStates.size());
+    _feedBackPrev.resize(_hiddenStates.size());
+    _hiddenActivations.resize(_hiddenStates.size() * _columnSize);
 
-    int visibleChunkCenterX = (hiddenChunkX + 0.5f) * toInputX1;
-    int visibleChunkCenterY = (hiddenChunkY + 0.5f) * toInputY1;
+    is.read(reinterpret_cast<char*>(_hiddenStates.data()), _hiddenStates.size() * sizeof(int));
+    is.read(reinterpret_cast<char*>(_hiddenStatesPrev.data()), _hiddenStatesPrev.size() * sizeof(int));
+    is.read(reinterpret_cast<char*>(_feedBack.data()), _feedBack.size() * sizeof(int));
+    is.read(reinterpret_cast<char*>(_feedBackPrev.data()), _feedBackPrev.size() * sizeof(int));
 
-    int visibleCenterX = (visibleChunkCenterX + 0.5f) * visibleChunkSize;
-    int visibleCenterY = (visibleChunkCenterY + 0.5f) * visibleChunkSize;
+    // If feedback is -1, clear to empty
+    if (_feedBack.front() == -1)
+        _feedBack.clear();
 
-    int spatialReverseHiddenRadius = std::ceil(_visibleLayerDescs[v]._backwardRadius / std::min(toInputX1, toInputY1)) + 2;
+    if (_feedBackPrev.front() == -1)
+        _feedBackPrev.clear();
 
-    int spatialReverseHiddenDiam = spatialReverseHiddenRadius * 2 + 1;
+    is.read(reinterpret_cast<char*>(_hiddenActivations.data()), _hiddenActivations.size() * sizeof(float));
 
-    weights.resize(spatialReverseHiddenDiam * spatialReverseHiddenDiam, 0.0f);
+    for (int v = 0; v < _visibleLayerDescs.size(); v++) {
+        // Visible layer data
+        _inputs[v].resize(_visibleLayerDescs[v]._width * _visibleLayerDescs[v]._height);
+        _inputsPrev[v].resize(_inputs[v].size());
+        _predictions[v].resize(_inputs[v].size());
+        
+        is.read(reinterpret_cast<char*>(_inputs[v].data()), _inputs[v].size() * sizeof(int));
+        is.read(reinterpret_cast<char*>(_inputsPrev[v].data()), _inputsPrev[v].size() * sizeof(int));
+        is.read(reinterpret_cast<char*>(_predictions[v].data()), _predictions[v].size() * sizeof(int));
 
-    int spatialChunkRadius1 = std::ceil(static_cast<float>(spatialReverseHiddenRadius) / static_cast<float>(visibleChunkSize));
+        // Forward weights
+        int forwardVecSize = _visibleLayerDescs[v]._forwardRadius * 2 + 1;
 
-    int lowerVisibleX = visibleCenterX - spatialReverseHiddenRadius;
-    int lowerVisibleY = visibleCenterY - spatialReverseHiddenRadius;
+        forwardVecSize *= forwardVecSize * _visibleLayerDescs[v]._columnSize;
 
-    int upperVisibleX = visibleCenterX + spatialReverseHiddenRadius;
-    int upperVisibleY = visibleCenterY + spatialReverseHiddenRadius;
+        _feedForwardWeights[v].resize(_hiddenWidth * _hiddenHeight * _columnSize);
 
-    for (int dcx = -spatialChunkRadius1; dcx <= spatialChunkRadius1; dcx++)
-        for (int dcy = -spatialChunkRadius1; dcy <= spatialChunkRadius1; dcy++) {
-            int cx = visibleChunkCenterX + dcx;
-            int cy = visibleChunkCenterY + dcy;
+        for (int x = 0; x < _hiddenWidth; x++)
+            for (int y = 0; y < _hiddenHeight; y++)
+                for (int c = 0; c < _columnSize; c++) {
+                    int hiddenCellIndex = x + y * _hiddenWidth + c * _hiddenWidth * _hiddenHeight;
 
-            if (cx >= 0 && cx < visibleChunksInX && cy >= 0 && cy < visibleChunksInY) {
-                int visibleChunkIndex = cx + cy * visibleChunksInX;
+                    _feedForwardWeights[v][hiddenCellIndex].resize(forwardVecSize);
 
-                // Project this chunk back to hidden
-                int spatialHiddenRadius = _visibleLayerDescs[v]._backwardRadius;
-
-                int spatialHiddenDiam = spatialHiddenRadius * 2 + 1;
-
-                float toInputX2 = static_cast<float>(hiddenChunksInX) / static_cast<float>(visibleChunksInX);
-                float toInputY2 = static_cast<float>(hiddenChunksInY) / static_cast<float>(visibleChunksInY);
-
-                int hiddenChunkCenterX = (cx + 0.5f) * toInputX2;
-                int hiddenChunkCenterY = (cy + 0.5f) * toInputY2;
-
-                int hiddenCenterX = (hiddenChunkCenterX + 0.5f) * hiddenChunkSize;
-                int hiddenCenterY = (hiddenChunkCenterY + 0.5f) * hiddenChunkSize;
-
-                int lowerHiddenX = hiddenCenterX - spatialHiddenRadius;
-                int lowerHiddenY = hiddenCenterY - spatialHiddenRadius;
-
-                int upperHiddenX = hiddenCenterX + spatialHiddenRadius;
-                int upperHiddenY = hiddenCenterY + spatialHiddenRadius;
-
-                if (x >= lowerHiddenX && x <= upperHiddenX && y >= lowerHiddenY && y <= upperHiddenY) {
-                    for (int c = 0; c < visibleBitsPerChunk; c++) {
-                        int mdx = c % visibleChunkSize;
-                        int mdy = c / visibleChunkSize;
-
-                        int vx = cx * visibleChunkSize + mdx;
-                        int vy = cy * visibleChunkSize + mdy;
-
-                        if (vx >= lowerVisibleX && vx <= upperVisibleX && vy >= lowerVisibleY && vy <= upperVisibleY) {
-                            int vIndex = vx + vy * _visibleLayerDescs[v]._width;
-
-                            int i = f + _feedBack.size() * vIndex;
-
-                            int wi = (x - lowerHiddenX) + (y - lowerHiddenY) * spatialHiddenDiam;
-
-                            assert(wi >= 0 && wi < _feedBackWeights[v][i].size());
-
-                            float weight = _feedBackWeights[v][i][wi];
-
-                            weights[(vx - lowerVisibleX) + (vy - lowerVisibleY) * spatialReverseHiddenDiam] = weight;
-                        }
-                    }
+                    is.read(reinterpret_cast<char*>(_feedForwardWeights[v][hiddenCellIndex].data()), _feedForwardWeights[v][hiddenCellIndex].size() * sizeof(float));
                 }
-            }
-        }
 
-    return weights;
+        // Backward weights
+        if (_visibleLayerDescs[v]._predict) {
+            _feedBackWeights[v].resize(_visibleLayerDescs[v]._width * _visibleLayerDescs[v]._height * _visibleLayerDescs[v]._columnSize);
+
+            int backwardVecSize = _visibleLayerDescs[v]._backwardRadius * 2 + 1;
+
+            backwardVecSize *= backwardVecSize * _columnSize;
+
+            for (int x = 0; x < _visibleLayerDescs[v]._width; x++)
+                for (int y = 0; y < _visibleLayerDescs[v]._height; y++)         
+                    for (int c = 0; c < _visibleLayerDescs[v]._columnSize; c++) {
+                        int visibleCellIndex = x + y * _visibleLayerDescs[v]._width + c * _visibleLayerDescs[v]._width * _visibleLayerDescs[v]._height;
+
+                        _feedBackWeights[v][visibleCellIndex].resize(backwardVecSize);
+                            
+                        is.read(reinterpret_cast<char*>(_feedBackWeights[v][visibleCellIndex].data()), _feedBackWeights[v][visibleCellIndex].size() * sizeof(float));
+                    }
+        }
+    }
+}
+
+void Layer::writeToStream(std::ostream &os) {
+    // Write header
+    os.write(reinterpret_cast<char*>(&_hiddenWidth), sizeof(int));
+    os.write(reinterpret_cast<char*>(&_hiddenHeight), sizeof(int));
+    os.write(reinterpret_cast<char*>(&_columnSize), sizeof(int));
+
+    // Write hyperparameters
+    os.write(reinterpret_cast<char*>(&_alpha), sizeof(float));
+    os.write(reinterpret_cast<char*>(&_beta), sizeof(float));
+    os.write(reinterpret_cast<char*>(&_codeIters), sizeof(int));
+
+    int numVisibleLayerDescs = _visibleLayerDescs.size();
+
+    os.write(reinterpret_cast<char*>(&numVisibleLayerDescs), sizeof(int));
+
+    os.write(reinterpret_cast<char*>(_visibleLayerDescs.data()), _visibleLayerDescs.size() * sizeof(VisibleLayerDesc));
+
+    // Hidden data
+    os.write(reinterpret_cast<char*>(_hiddenStates.data()), _hiddenStates.size() * sizeof(int));
+    os.write(reinterpret_cast<char*>(_hiddenStatesPrev.data()), _hiddenStatesPrev.size() * sizeof(int));
+
+    std::vector<int> writeFeedBack = _feedBack;
+    std::vector<int> writeFeedBackPrev = _feedBackPrev;
+
+    if (writeFeedBack.empty())
+        writeFeedBack.resize(_hiddenStates.size(), -1);
+
+    if (writeFeedBackPrev.empty())
+        writeFeedBackPrev.resize(_hiddenStates.size(), -1);
+
+    os.write(reinterpret_cast<char*>(writeFeedBack.data()), writeFeedBack.size() * sizeof(int));
+    os.write(reinterpret_cast<char*>(writeFeedBackPrev.data()), writeFeedBackPrev.size() * sizeof(int));
+    os.write(reinterpret_cast<char*>(_hiddenActivations.data()), _hiddenActivations.size() * sizeof(float));
+
+    for (int v = 0; v < _visibleLayerDescs.size(); v++) {
+        // Visible layer data
+        os.write(reinterpret_cast<char*>(_inputs[v].data()), _inputs[v].size() * sizeof(int));
+        os.write(reinterpret_cast<char*>(_inputsPrev[v].data()), _inputsPrev[v].size() * sizeof(int));
+        os.write(reinterpret_cast<char*>(_predictions[v].data()), _predictions[v].size() * sizeof(int));
+
+        // Forward weights
+        for (int x = 0; x < _hiddenWidth; x++)
+            for (int y = 0; y < _hiddenHeight; y++)
+                for (int c = 0; c < _columnSize; c++) {
+                    int hiddenCellIndex = x + y * _hiddenWidth + c * _hiddenWidth * _hiddenHeight;
+
+                    os.write(reinterpret_cast<char*>(_feedForwardWeights[v][hiddenCellIndex].data()), _feedForwardWeights[v][hiddenCellIndex].size() * sizeof(float));
+                }
+
+        // Backward weights
+        if (_visibleLayerDescs[v]._predict) {
+            for (int x = 0; x < _visibleLayerDescs[v]._width; x++)
+                for (int y = 0; y < _visibleLayerDescs[v]._height; y++)         
+                    for (int c = 0; c < _visibleLayerDescs[v]._columnSize; c++) {
+                        int visibleCellIndex = x + y * _visibleLayerDescs[v]._width + c * _visibleLayerDescs[v]._width * _visibleLayerDescs[v]._height;
+                            
+                        os.write(reinterpret_cast<char*>(_feedBackWeights[v][visibleCellIndex].data()), _feedBackWeights[v][visibleCellIndex].size() * sizeof(float));
+                    }
+        }
+    }
 }

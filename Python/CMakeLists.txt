@@ -1,6 +1,6 @@
 # ----------------------------------------------------------------------------
 #  EOgmaNeo
-#  Copyright(c) 2017 Ogma Intelligent Systems Corp. All rights reserved.
+#  Copyright(c) 2017-2018 Ogma Intelligent Systems Corp. All rights reserved.
 #
 #  This copy of EOgmaNeo is licensed to you under the terms described
 #  in the EOGMANEO_LICENSE.md file included in this distribution.
@@ -31,30 +31,8 @@ if(PYTHON_VERSION)
     message("Python target version: ${PYTHON_VERSION}")            
 endif()
 
-option(BUILD_PREENCODERS OFF)
+option(BUILD_PREENCODERS ON)
 message(STATUS "Build pre-encoders: ${BUILD_PREENCODERS}")
-
-
-############################################################################
-# Add SFML
-find_package(SFML 2 COMPONENTS system network)
-
-if(SFML_FOUND)
-  #message(STATUS "SFML incs: " ${SFML_INCLUDE_DIR})
-  #message(STATUS "SFML libs: " ${SFML_LIBRARIES})
-  include_directories(${SFML_INCLUDE_DIR})
-endif()
-
-
-############################################################################
-# Find OpenCV
-
-find_package(OpenCV HINTS /usr/local/opt/opencv3)
-
-if(OpenCV_FOUND)
-    #message(STATUS "Found existing OpenCV in ${OpenCV_INCLUDE_DIRS}")
-    include_directories(${OpenCV_INCLUDE_DIRS})
-endif()
 
 
 ############################################################################
@@ -70,31 +48,17 @@ file(GLOB_RECURSE EOGMANEO_SRC
 )
 
 if (BUILD_PREENCODERS)
-  file(GLOB_RECURSE EOGMANEO_CORNERENCODER_SRC "../source/optional/CornerEncoder.*")
-  list(APPEND EOGMANEO_SRC ${EOGMANEO_CORNERENCODER_SRC})
+  file(GLOB_RECURSE EOGMANEO_IMAGEENCODER_SRC "../source/optional/ImageEncoder.*")
+  list(APPEND EOGMANEO_SRC ${EOGMANEO_IMAGEENCODER_SRC})
 
-  file(GLOB_RECURSE EOGMANEO_RANDOMENCODER_SRC "../source/optional/RandomEncoder.*")
-  list(APPEND EOGMANEO_SRC ${EOGMANEO_RANDOMENCODER_SRC})
-endif()
+  file(GLOB_RECURSE EOGMANEO_KMEANSENCODER_SRC "../source/optional/KMeansEncoder.*")
+  list(APPEND EOGMANEO_SRC ${EOGMANEO_KMEANSENCODER_SRC})
 
-if(SFML_FOUND)
-  file(GLOB_RECURSE EOGMANEO_SFML_SRC "../source/optional/VisAdapter.*")
-  list(APPEND EOGMANEO_SRC ${EOGMANEO_SFML_SRC})
-endif()
-if(OpenCV_FOUND)
-  file(GLOB_RECURSE EOGMANEO_OPENCV_SRC "../source/optional/OpenCVInterop.*")
-  list(APPEND EOGMANEO_SRC ${EOGMANEO_OPENCV_SRC})
+  file(GLOB_RECURSE EOGMANEO_GABORENCODER_SRC "../source/optional/GaborEncoder.*")
+  list(APPEND EOGMANEO_SRC ${EOGMANEO_GABORENCODER_SRC})
 endif()
 
 add_library(EOgmaNeo ${EOGMANEO_SRC})
-
-if(SFML_FOUND)
-  target_link_libraries(EOgmaNeo ${SFML_LIBRARIES})
-endif()
-if(OpenCV_FOUND)
-    target_link_libraries(EOgmaNeo ${OpenCV_LIBS})
-endif()
-
 
 ############################################################################
 # Find SWIG and setup building the Python bindings to EOgmaNeo library
@@ -119,15 +83,16 @@ execute_process(
     OUTPUT_STRIP_TRAILING_WHITESPACE
     ERROR_STRIP_TRAILING_WHITESPACE
 )
+
 if(${_CONDA_RESULT} STREQUAL "0")
     string(TOLOWER ${_CONDA_OUTPUT} _CONDA_OUTPUT)
     string(REPLACE "\\" "/" _CONDA_OUTPUT ${_CONDA_OUTPUT})
-    string(REGEX MATCH "anaconda" ANACONDA_PYTHON_FOUND "${_CONDA_OUTPUT}")
+    string(FIND "${_CONDA_OUTPUT}" "conda" ANACONDA_PYTHON_FOUND)
 endif()
 
 if(ANACONDA_PYTHON_FOUND)
     set(ANACONDA_PYTHON_DIR ${_CONDA_OUTPUT})
-    message("Found anaconda in ${ANACONDA_PYTHON_DIR}")
+    message(STATUS "Found anaconda in ${ANACONDA_PYTHON_DIR}")
 
     set(_PYTHON_COMMAND python --version)
     execute_process(
@@ -138,8 +103,8 @@ if(ANACONDA_PYTHON_FOUND)
     )
     string(REGEX MATCH "Python ([0-9]+)[.]([0-9]+)[.]([0-9]+)" _PYTHON_VERSION_FOUND "${_PYTHON_ERROR}")
     set(_PYTHON_VERSION_MAJOR ${CMAKE_MATCH_1})
-    set(_PYTHON_VERSION_MINOR ${CMAKE_MATCH_2})
-    set(_PYTHON_VERSION_PATCH ${CMAKE_MATCH_3})
+    set(_PYTHON_VERSION_MINOR ${CMAKE_MATCH_3})
+    set(_PYTHON_VERSION_PATCH ${CMAKE_MATCH_0})
 
     if(WIN32)
         set(ANACONDA_PYTHON_VERSION ${_PYTHON_VERSION_MAJOR}${_PYTHON_VERSION_MINOR})
@@ -155,14 +120,14 @@ if(ANACONDA_PYTHON_FOUND)
         set(_PYTHON_LIB "lib/${CMAKE_SHARED_LIBRARY_PREFIX}python${ANACONDA_PYTHON_VERSION}${_PYTHON_EXTENSION}${CMAKE_SHARED_LIBRARY_SUFFIX}")
     endif()
 
-    if(NOT DEFINED ENV{CONDA_DEFAULT_ENV})
+    if(NOT DEFINED ENV{CONDA_DEFAULT_ENV} OR $ENV{CONDA_DEFAULT_ENV} STREQUAL "base")
         set(PYTHON_INCLUDE_DIR "${ANACONDA_PYTHON_DIR}/include/${_PYTHON_ID}" CACHE INTERNAL "")
         set(PYTHON_LIBRARY "${ANACONDA_PYTHON_DIR}/${_PYTHON_LIB}" CACHE INTERNAL "")
     else()
         set(_CONDA_DEFAULT_ENV $ENV{CONDA_DEFAULT_ENV})
         string(REPLACE "\\" "/" _CONDA_DEFAULT_ENV ${_CONDA_DEFAULT_ENV})
-        set(PYTHON_INCLUDE_DIR "${ANACONDA_PYTHON_DIR}/envs/${_CONDA_DEFAULT_ENV}/include/${_PYTHON_ID}" CACHE INTERNAL "")
-        set(PYTHON_LIBRARY "${ANACONDA_PYTHON_DIR}/envs/${_CONDA_DEFAULT_ENV}/${_PYTHON_LIB}" CACHE INTERNAL "")
+        set(PYTHON_INCLUDE_DIR "${ANACONDA_PYTHON_DIR}/${_CONDA_DEFAULT_ENV}/include/${_PYTHON_ID}" CACHE INTERNAL "")
+        set(PYTHON_LIBRARY "${ANACONDA_PYTHON_DIR}/${_CONDA_DEFAULT_ENV}/${_PYTHON_LIB}" CACHE INTERNAL "")
     endif()
 
     message("PYTHON_INCLUDE_DIR = ${PYTHON_INCLUDE_DIR}")
@@ -180,14 +145,14 @@ else()
             if(NOT PYTHON_VERSION)
                 find_package(PythonLibs)
             else()
-                find_package(PythonLibs ${PYTHON_VERSION})            
+                find_package(PythonLibs ${PYTHON_VERSION})
             endif()
         endif()
     else()
         if(NOT PYTHON_VERSION)
             find_package(PythonLibs)
         else()
-            find_package(PythonLibs ${PYTHON_VERSION})            
+            find_package(PythonLibs ${PYTHON_VERSION})
         endif()
     endif()
 endif()
@@ -204,14 +169,6 @@ set(CMAKE_SWIG_FLAGS "-I\"${PYTHON_INCLUDE_DIR}\" -I\"${EOGMANEO_INCLUDE_DIR}\""
 if(BUILD_PREENCODERS)
   list(APPEND CMAKE_SWIG_FLAGS -DBUILD_PREENCODERS)
   add_definitions(-DBUILD_PREENCODERS)
-endif()
-if(SFML_FOUND)
-  list(APPEND CMAKE_SWIG_FLAGS -DSFML_FOUND)
-  add_definitions(-DSFML_FOUND)
-endif()
-if (OpenCV_FOUND)
-  list(APPEND CMAKE_SWIG_FLAGS -DOPENCV_FOUND)
-  add_definitions(-DOPENCV_FOUND)
 endif()
 if(MSVC)
     add_definitions(-D_CRT_SECURE_NO_WARNINGS)

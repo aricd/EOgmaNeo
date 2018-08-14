@@ -1,6 +1,6 @@
 // ----------------------------------------------------------------------------
 //  EOgmaNeo
-//  Copyright(c) 2017 Ogma Intelligent Systems Corp. All rights reserved.
+//  Copyright(c) 2017-2018 Ogma Intelligent Systems Corp. All rights reserved.
 //
 //  This copy of EOgmaNeo is licensed to you under the terms described
 //  in the EOGMANEO_LICENSE.md file included in this distribution.
@@ -9,7 +9,6 @@
 #pragma once
 
 #include "Layer.h"
-#include "ComputeSystem.h"
 
 namespace eogmaneo {
     /*!
@@ -25,17 +24,16 @@ namespace eogmaneo {
         //!@}
 
         /*!
-        \brief The size of a chunk.
-        This size is the diameter of the chunk. The number of bits in a chunk is therefore _chunkSize^2.
+        \brief The size of a column.
         */
-		int _chunkSize;
+		int _columnSize;
 
         //!@{
         /*!
-        \brief Radii of forward and backward sparse weight matrices.
+        \brief Radii of forward, lateral and backward sparse weight matrices.
         */
 		int _forwardRadius;
-		int _backwardRadius;
+        int _backwardRadius;
         //!@}
 
         /*!
@@ -49,48 +47,17 @@ namespace eogmaneo {
 		int _temporalHorizon;
 
         /*!
-        \brief Feed forward learning rate (encoder).
-        */
-        float _alpha;
-
-        /*!
-        \brief Feed back learning rate (decoder).
-        */
-        float _beta;
-
-        /*!
-        \brief Q learning rate (decoder).
-        */
-        float _delta;
-
-        /*!
-        \brief Q discount factor (decoder).
-        */
-        float _gamma;
-
-        /*!
-        \brief Q trace cutoff value (minimum trace strength).
-        */
-        float _traceCutoff;
-
-        /*!
-        \brief Q exploration rate (decoder).
-        */
-        float _epsilon;
-        
-        /*!
         \brief Initialize defaults.
         */
 		LayerDesc()
-			: _width(36), _height(36), _chunkSize(6),
-			_forwardRadius(9), _backwardRadius(9),
-			_ticksPerUpdate(2), _temporalHorizon(2),
-			_alpha(0.01f), _beta(0.05f), _delta(0.0f), _gamma(0.99f), _traceCutoff(0.01f), _epsilon(0.01f)
+			: _width(4), _height(4), _columnSize(16),
+			_forwardRadius(2), _backwardRadius(2),
+			_ticksPerUpdate(2), _temporalHorizon(2)
 		{}
 	};
 
     /*!
-    \brief A hierarchy of layers, or agent (if reward is supplied).
+    \brief A hierarchy of layers, using exponential memory structure.
     */
     class Hierarchy {
     private:
@@ -98,53 +65,43 @@ namespace eogmaneo {
 
         std::vector<std::vector<std::vector<int> > > _histories;
 
-		std::vector<float> _alphas;
-        std::vector<float> _betas;
-        std::vector<float> _deltas;
-        std::vector<float> _gammas;
-        std::vector<float> _traceCutoffs;
-        std::vector<float> _epsilons;
-
-        std::vector<float> _rewardSums;
-        std::vector<float> _rewardCounts;
+        std::vector<int> _updates;
 
         std::vector<int> _ticks;
         std::vector<int> _ticksPerUpdate;
 
         int _inputTemporalHorizon;
-        int _numInputs;
+        std::vector<std::pair<int, int> > _inputSizes;
 
     public:
         /*!
         \brief Create the hierarchy.
         \param inputSizes vector of input dimension tuples.
-        \param inputChunkSizes vector of input chunk sizes (diameters).
-        \param predictInputs vector of booleans for which inputs should be predicted.
+        \param inputColumnSizes vector of input column sizes.
+        \param predictInputs flags for which inputs to generate predictions for.
         \param layerDescs vector of LayerDesc structures, describing each layer in sequence.
         \param seed random number generator seed for generating the hierarchy.
         */
-        void create(const std::vector<std::pair<int, int> > &inputSizes, const std::vector<int> &inputChunkSizes, const std::vector<bool> &predictInputs, const std::vector<LayerDesc> &layerDescs, unsigned long seed);
+        void create(const std::vector<std::pair<int, int> > &inputSizes, const std::vector<int> &inputColumnSizes, const std::vector<bool> &predictInputs, const std::vector<LayerDesc> &layerDescs, unsigned long seed);
 
         /*!
-        \brief Load a hierarchy from a file instead of creating it randomly (as done by create(...) ).
-        Takes the file name.
+        \brief Simulation step/tick.
+        \param cs compute system to be used.
+        \param inputs vector of SDR vectors in columnar format.
+        \param learn whether learning should be enabled, defaults to true.
+        \param topFeedBack SDR vector in columnar format of top-level feed back state.
         */
-        bool load(const std::string &fileName);
+        void step(ComputeSystem &cs, const std::vector<std::vector<int> > &inputs, bool learn = true, const std::vector<int> &topFeedBack = {});
 
         /*!
-        \brief Save a hierarchy to a file.
-        Takes the file name.
+        \brief Save the hierarchy to a file.
         */
         void save(const std::string &fileName);
 
         /*!
-        \brief Simulation tick.
-        \param inputs vector of SDR vectors in chunked format.
-        \param cs compute system to be used.
-        \param learn whether learning should be enabled, defaults to true.
-        \param reward reinforcement signal, defaults to 0.
+        \brief Load the hierarchy from a file.
         */
-        void step(const std::vector<std::vector<int> > &inputs, ComputeSystem &cs, bool learn = true, float reward = 0.0f);
+        bool load(const std::string &fileName);
 
         /*!
         \brief Get the number of (hidden) layers.
@@ -157,42 +114,31 @@ namespace eogmaneo {
         \brief Get the predicted version of the input.
         \param i the index of the input to retrieve.
         */
-        const std::vector<int> &getPrediction(int i) const {
+        const std::vector<int> &getPredictions(int i) const {
             int index = i * _inputTemporalHorizon;
 
-            return _layers.front()._predictions[index];
+            return _layers.front().getPredictions(index);
         }
 
-        //!@{
         /*!
-        \brief Accessors for layer parameters.
+        \brief Whether this layer received on update this timestep.
         */
-        float getAlpha(int l) const {
-            return _alphas[l];
+        bool getUpdate(int l) const {
+            return _updates[l];
         }
-
-        float getBeta(int l) const {
-            return _betas[l];
-        }
-        
-        float getDelta(int l) const {
-            return _deltas[l];
-        }
-        
-        float getGamma(int l) const {
-            return _gammas[l];
-        }
-
-        float getEpsilon(int l) const {
-            return _epsilons[l];
-        }
-        //!@}
 
         /*!
         \brief Get current layer ticks, relative to previous layer.
         */
         int getTicks(int l) const {
             return _ticks[l];
+        }
+
+        /*!
+        \brief Get layer ticks per update, relative to previous layer.
+        */
+        int getTicksPerUpdate(int l) const {
+            return _ticksPerUpdate[l];
         }
 
         /*!
@@ -205,7 +151,7 @@ namespace eogmaneo {
         /*!
         \brief Retrieve a layer.
         */
-        const Layer &getLayer(int l) const {
+        Layer &getLayer(int l) {
             return _layers[l];
         }
     };
